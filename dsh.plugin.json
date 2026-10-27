@@ -1,0 +1,14 @@
+{
+  "name": "dsh-peak-valley-meter",
+  "description": "峰谷时计：DeepSeek API 峰谷时段实时卡片（当前时段、切换倒计时、当前档位价格）；峰/谷显示名称、价格、时段窗口、颜色与显示位置全部可配置。",
+  "version": "0.3.0",
+  "entry": {
+    "name": "dsh-peak-valley-meter",
+    "inject": [
+      "tools"
+    ]
+  },
+  "client": {
+    "platform": "web"
+  }
+}

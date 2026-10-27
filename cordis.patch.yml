@@ -1,0 +1,13 @@
+# dsh-peak-valley-meter bundle patch: one host row over the web profile,
+# resolved through the profile's own node_modules where the package is installed.
+- insert:
+    - id: peak-valley-price
+      name: dsh-peak-valley-meter
+      # 示例配置：自定义峰/谷显示名称与价格（全部可选，见 README）。
+      # config:
+      #   peakLabel: 高峰
+      #   valleyLabel: 低谷
+      #   timezone: Asia/Shanghai
+      #   peakPrice: 9.0
+      #   valleyPrice: 4.5
+      #   position: dock
