@@ -16,7 +16,7 @@ const plain = (value) => JSON.parse(JSON.stringify(value));
 const minute = 60_000;
 const epoch = Date.UTC(2026, 9, 21, 1);
 const status = (overrides = {}) => ({
-  serverNow: epoch, configVersion: 'a',
+  serverNow: epoch, configVersion: '0', configNamespace: 'custom-tariff-instance', configWritable: true,
   settings: { position: 'input-left', peakLabel: 'P', valleyLabel: 'V', reminders: { beforeMinutes: 10, beforePeak: true, beforeValley: true, onPeak: true, onValley: true } },
   current: { period: 'off-peak' },
   nextSwitch: { epoch: epoch + 20 * minute, period: 'peak', label: 'P' },
@@ -249,13 +249,38 @@ test('settings patches leave untouched custom prices and rules intact', () => {
   assert.deepEqual(plain(patch), { peakLabel: 'New' });
   assert.throws(() => logic.patchFromDraft({ peakPrice: '' }, { peakPrice: true }, original), /invalid/);
   const reminder = logic.patchFromDraft({ reminders: { beforeMinutes: '15' } }, { reminders: true }, original).reminders;
-  assert.equal(reminder.beforeMinutes, 15);
-  assert.equal(reminder.onValley, true);
+  assert.deepEqual(plain(reminder), { beforeMinutes: 15 });
   assert.throws(() => logic.patchFromDraft({ reminders: { beforeMinutes: 61 } }, { reminders: true }, original), /invalid/);
   assert.deepEqual(plain(logic.parseWindows('[[22,2],[6.5,7]]')), [[22, 2], [6.5, 7]]);
   assert.throws(() => logic.parseWindows('[[2,2]]'), /invalidWindows/);
   assert.throws(() => logic.parseWindows('[[1.001,2]]'), /invalidWindows/);
   assert.deepEqual(plain(logic.settingsOf({ labels: { peak: 'Old', valley: 'Low' }, flags: { showPrice: false }, peakPrice: 9 })), { peakPrice: 9, peakLabel: 'Old', valleyLabel: 'Low', showPrice: false });
+});
+
+test('changing one reminder writes only its changed native leaf path', async () => {
+  const initial = status();
+  const draft = { ...initial.settings, reminders: { ...initial.settings.reminders, onPeak: false } };
+  const patch = logic.patchFromDraft(draft, { reminders: true }, initial.settings);
+  assert.deepEqual(plain(patch), { reminders: { onPeak: false } });
+  assert.deepEqual(plain(logic.patchFromDraft({ ...draft, reminders: { ...draft.reminders, onPeak: true, beforeMinutes: '10' } }, { reminders: true }, initial.settings)), {});
+  assert.deepEqual(plain(logic.patchFromDraft({ reminders: { onPeak: true } }, { reminders: true }, {})), { reminders: { onPeak: true } });
+  const env = environment();
+  const mutations = [];
+  let current = initial;
+  const controller = logic.createController({
+    call: async () => ({ ok: true, value: current }),
+    mutateSettings: async (...args) => {
+      mutations.push(plain(args));
+      current = status({ configVersion: '1', settings: draft });
+      return { revision: 1 };
+    },
+  }, env);
+  await controller.refresh();
+  await controller.save(patch, initial);
+  assert.deepEqual(mutations, [['custom-tariff-instance', [{ op: 'set', path: ['reminders', 'onPeak'], value: false }], 0]]);
+  assert.equal(controller.getSnapshot().status.settings.reminders.beforeMinutes, 10);
+  assert.equal(controller.getSnapshot().status.settings.reminders.beforePeak, true);
+  controller.dispose();
 });
 
 test('one shared clock serves subscribers, adopts serverNow, and cleans every timer', async () => {
@@ -277,40 +302,288 @@ test('one shared clock serves subscribers, adopts serverNow, and cleans every ti
   assert.equal(env.timers.size, 0);
 });
 
-test('ordered requests discard an old status when a save is queued and immediately publish the save', async () => {
+test('ordered requests discard an old status when a native save is queued', async () => {
   const env = environment();
-  const first = deferred();
+  const oldRead = deferred();
   const calls = [];
-  const controller = logic.createController({ call: (method, payload) => {
-    calls.push([method, payload]);
-    return calls.length === 1 ? first.promise : Promise.resolve({ ok: true, value: status({ configVersion: 'b', settings: { position: 'off' } }) });
-  } }, env);
+  let reads = 0;
+  const controller = logic.createController({
+    call: (method, payload) => {
+      calls.push([method, payload]);
+      reads++;
+      return reads === 2 ? oldRead.promise : Promise.resolve({ ok: true, value: reads === 1 ? status() : status({ configVersion: '1', settings: { position: 'off' } }) });
+    },
+    mutateSettings: async (...args) => { calls.push(['mutate', ...args]); return { ns: 'custom-tariff-instance', revision: 1, value: { position: 'off' } }; },
+  }, env);
+  await controller.refresh();
   const reading = controller.refresh();
   await settle();
-  const saving = controller.save({ position: 'off', _revision: 'a' });
-  first.resolve({ ok: true, value: status() });
+  const saving = controller.save({ position: 'off' }, status());
+  oldRead.resolve({ ok: true, value: status({ settings: { position: 'stale' } }) });
   await reading;
   await saving;
-  assert.equal(calls[0][0], 'status');
-  assert.equal(calls[0][1], null);
-  assert.equal(calls[1][0], 'updateConfig');
-  assert.equal(controller.getSnapshot().status.configVersion, 'b');
+  assert.deepEqual(calls.map(call => call[0]), ['status', 'status', 'mutate', 'status']);
+  assert.deepEqual(plain(calls[2].slice(1)), ['custom-tariff-instance', [{ op: 'set', path: ['position'], value: 'off' }], 0]);
+  assert.equal(controller.getSnapshot().status.configVersion, '1');
   assert.equal(controller.getSnapshot().status.settings.position, 'off');
   controller.dispose();
 });
 
-test('a rejected save reloads Host values without treating the draft as committed', async () => {
+test('a rejected native save reloads Host values without retrying the old draft', async () => {
   const env = environment();
   const calls = [];
-  const controller = logic.createController({ call: async (method) => {
-    calls.push(method);
-    return method === 'updateConfig' ? { ok: false, error: { message: 'revision conflict' } } : { ok: true, value: status({ configVersion: 'latest' }) };
-  } }, env);
-  await assert.rejects(controller.save({ _revision: 'old', position: 'off' }), /revision conflict/);
+  let revision = '0';
+  const controller = logic.createController({
+    call: async (method) => { calls.push(method); return { ok: true, value: status({ configVersion: revision }) }; },
+    mutateSettings: async () => { calls.push('mutate'); revision = '2'; throw new Error('changed'); },
+  }, env);
+  await controller.refresh();
+  const patch = { position: 'off' };
+  await assert.rejects(controller.save(patch, status()), /changed/);
   await settle();
-  assert.deepEqual(calls, ['updateConfig', 'status']);
-  assert.equal(controller.getSnapshot().status.configVersion, 'latest');
+  assert.deepEqual(calls, ['status', 'mutate', 'status']);
+  assert.equal(controller.getSnapshot().status.configVersion, '2');
+  assert.deepEqual(patch, { position: 'off' });
   controller.dispose();
+});
+
+test('native adapter sends named args and unwraps only the connection result', async () => {
+  const calls = [];
+  const descriptor = { ns: 'renamed-entry', revision: 8, value: { showPrice: false } };
+  const connection = { rpc: { call: async (...args) => { calls.push(args); return { ok: true, value: descriptor }; } } };
+  const api = logic.createApi(connection);
+  const ops = [{ op: 'set', path: ['showPrice'], value: false }];
+  assert.equal(await api.mutateSettings('renamed-entry', ops, 7), descriptor);
+  assert.deepEqual(plain(calls[0]), ['/api', 'settings/mutate', { args: { ns: 'renamed-entry', ops, expectedRevision: 7 } }]);
+  assert.equal((await api.call('status')).value, descriptor);
+  assert.deepEqual(plain(calls[1]), ['/api', 'peak-valley-price/status', null]);
+  connection.rpc.call = async () => ({ ok: false, error: { code: 'settings/conflict', message: 'stale revision' } });
+  await assert.rejects(api.mutateSettings('renamed-entry', ops, 7), error => error.message === 'changed' && error.code === 'settings/conflict');
+});
+
+test('only complete native metadata with a strict revision can enable saving', () => {
+  assert.deepEqual(plain(logic.settingsBinding(status())), { ns: 'custom-tariff-instance', revision: 0 });
+  assert.equal(logic.canSaveSettings(status()), true);
+  for (const configVersion of [null, undefined, '', ' ', 'legacy-hash', '1.0', '1e2', '-1', '01', '9007199254740992', 1]) {
+    assert.equal(logic.canSaveSettings(status({ configVersion })), false, String(configVersion));
+  }
+  for (const configNamespace of [undefined, null, '', ' ']) assert.equal(logic.canSaveSettings(status({ configNamespace })), false);
+  assert.equal(logic.canSaveSettings(status({ configWritable: false })), false);
+  assert.equal(logic.canSaveSettings(status({ configWritable: undefined })), false);
+  for (const settings of [undefined, null, [], 'invalid']) assert.equal(logic.canSaveSettings(status({ settings })), false);
+});
+
+test('read-only or incomplete metadata never falls back to a custom write', async () => {
+  for (const overrides of [{ configWritable: false, configVersion: null }, { configNamespace: undefined }, { configVersion: 'legacy-hash' }, { configWritable: undefined }]) {
+    const env = environment();
+    const methods = [];
+    let mutations = 0;
+    const current = status(overrides);
+    const controller = logic.createController({
+      call: async method => { methods.push(method); return { ok: true, value: current }; },
+      mutateSettings: async () => { mutations++; },
+    }, env);
+    await controller.refresh();
+    await assert.rejects(controller.save({ position: 'off' }, current), /settingsUnavailable/);
+    await settle();
+    assert.equal(mutations, 0);
+    assert.equal(methods.every(method => method === 'status'), true);
+    controller.dispose();
+  }
+});
+
+test('a draft stays bound to its namespace and revision even after another status arrives', async () => {
+  for (const overrides of [{ configNamespace: 'other-entry' }, { configVersion: '1' }]) {
+    const env = environment();
+    let current = status();
+    let mutations = 0;
+    const controller = logic.createController({
+      call: async () => ({ ok: true, value: current }),
+      mutateSettings: async () => { mutations++; },
+    }, env);
+    await controller.refresh();
+    const draftBinding = { configNamespace: current.configNamespace, configVersion: current.configVersion };
+    current = status(overrides);
+    await controller.refresh();
+    await assert.rejects(controller.save({ position: 'off' }, draftBinding), /changed/);
+    assert.equal(mutations, 0);
+    controller.dispose();
+  }
+});
+
+test('queued saves cannot silently reuse an old revision', async () => {
+  const env = environment();
+  const mutation = deferred();
+  let revision = '0';
+  let mutations = 0;
+  const controller = logic.createController({
+    call: async () => ({ ok: true, value: status({ configVersion: revision }) }),
+    mutateSettings: async () => { mutations++; await mutation.promise; revision = '1'; return { revision: 1 }; },
+  }, env);
+  await controller.refresh();
+  const first = controller.save({ position: 'off' }, status());
+  const second = assert.rejects(controller.save({ peakLabel: 'new' }, status()), /changed/);
+  mutation.resolve();
+  await first; await second;
+  assert.equal(mutations, 1);
+  controller.dispose();
+});
+
+test('a committed save is not reported complete if the status read fails', async () => {
+  const env = environment();
+  let reads = 0;
+  let mutations = 0;
+  const controller = logic.createController({
+    call: async () => { reads++; if (reads === 2) throw new Error('offline'); return { ok: true, value: status({ configVersion: reads > 2 ? '1' : '0' }) }; },
+    mutateSettings: async () => { mutations++; return { revision: 1 }; },
+  }, env);
+  await controller.refresh();
+  await assert.rejects(controller.save({ position: 'off' }, status()), /savedRefreshFailed/);
+  await settle();
+  assert.equal(mutations, 1);
+  assert.equal(controller.getSnapshot().status.configVersion, '1');
+  controller.dispose();
+});
+
+test('native setting invalidation refreshes only its own entry and rereads an in-flight snapshot', async () => {
+  const env = environment();
+  const pending = deferred();
+  let reads = 0;
+  const controller = logic.createController({ call: async () => {
+    reads++;
+    return reads === 2 ? pending.promise : { ok: true, value: status({ configVersion: reads > 2 ? '1' : '0' }) };
+  } }, env);
+  await controller.refresh();
+  controller.invalidateSettings('another-entry'); await settle();
+  assert.equal(reads, 1);
+  const reading = controller.refresh(); await settle();
+  controller.invalidateSettings('custom-tariff-instance');
+  pending.resolve({ ok: true, value: status() });
+  await reading; await settle();
+  assert.equal(reads, 3);
+  assert.equal(controller.getSnapshot().status.configVersion, '1');
+  controller.dispose();
+});
+
+// Run the real Settings component with deterministic hooks; DOM layout is not involved.
+function settingsHarness(controller) {
+  const hooks = [];
+  let cursor = 0;
+  let effects = [];
+  let changed = false;
+  let subject;
+  const react = {
+    memo: component => component,
+    createElement: (type, props, ...children) => ({ type, props: props || {}, children: children.flat(Infinity) }),
+    useSyncExternalStore: (_subscribe, snapshot) => snapshot(),
+    useCallback: callback => callback,
+    useState(initial) {
+      const index = cursor++;
+      if (!(index in hooks)) hooks[index] = initial;
+      return [hooks[index], value => {
+        const next = typeof value === 'function' ? value(hooks[index]) : value;
+        if (!Object.is(next, hooks[index])) { hooks[index] = next; changed = true; }
+      }];
+    },
+    useRef(initial) {
+      const index = cursor++;
+      if (!(index in hooks)) hooks[index] = { current: initial };
+      return hooks[index];
+    },
+    useEffect(callback, deps) {
+      const index = cursor++;
+      if (!hooks[index] || deps.some((value, i) => !Object.is(value, hooks[index][i]))) {
+        hooks[index] = deps;
+        effects.push(callback);
+      }
+    },
+  };
+  vm.runInNewContext(readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8'), {
+    window: { __ModuleLoader__: { load: definition => { subject = definition.factory(() => react); } } },
+  });
+  return () => {
+    let tree;
+    do {
+      changed = false; cursor = 0; effects = [];
+      tree = subject.__test.Settings({ controller });
+      for (const effect of effects) effect();
+    } while (changed);
+    return tree;
+  };
+}
+function elements(tree, type) {
+  if (!tree || typeof tree !== 'object') return [];
+  return [...(tree.type === type ? [tree] : []), ...(tree.children || []).flatMap(child => elements(child, type))];
+}
+function peakLabelInput(tree) {
+  const label = elements(tree, 'label').find(item => item.children.some(child => child?.type === 'span' && child.children.includes('Peak label')));
+  return label.children.find(child => child?.type === 'input');
+}
+
+test('the settings form retains a rejected dirty draft and requires reloading a changed namespace', async () => {
+  let view = { status: status(), error: null };
+  const saved = [];
+  const controller = {
+    subscribe: () => () => {}, getSnapshot: () => view,
+    save: async (...args) => { saved.push(plain(args)); throw new Error('changed'); },
+  };
+  const render = settingsHarness(controller);
+  let tree = render();
+  peakLabelInput(tree).props.onChange({ target: { value: 'My unsaved label' } });
+  tree = render();
+  await tree.props.onSubmit({ preventDefault() {} });
+  tree = render();
+  assert.equal(peakLabelInput(tree).props.value, 'My unsaved label');
+  assert.deepEqual(saved, [[{ peakLabel: 'My unsaved label' }, { configNamespace: 'custom-tariff-instance', configVersion: '0' }]]);
+  view = { ...view, status: status({ configNamespace: 'other-entry', settings: { ...status().settings, peakLabel: 'Latest label' } }) };
+  tree = render();
+  assert.equal(peakLabelInput(tree).props.value, 'My unsaved label');
+  assert.equal(elements(tree, 'button').find(item => item.props.type === 'submit').props.disabled, true);
+  await tree.props.onSubmit({ preventDefault() {} });
+  assert.equal(saved.length, 1);
+  elements(tree, 'button').find(item => item.children.includes('Discard edits')).props.onClick();
+  tree = render();
+  assert.equal(peakLabelInput(tree).props.value, 'Latest label');
+});
+
+test('the settings form shows read-only reason and never submits without native metadata', async () => {
+  let writes = 0;
+  const controller = {
+    subscribe: () => () => {},
+    getSnapshot: () => ({ status: status({ configWritable: false, configVersion: null, configError: 'Settings service is unavailable' }) }),
+    save: async () => { writes++; },
+  };
+  // Keep snapshot identity stable, as useSyncExternalStore requires.
+  const snapshot = controller.getSnapshot();
+  controller.getSnapshot = () => snapshot;
+  const render = settingsHarness(controller);
+  const tree = render();
+  assert.equal(peakLabelInput(tree).props.disabled, true);
+  assert.equal(elements(tree, 'button').find(item => item.props.type === 'submit').props.disabled, true);
+  assert.equal(elements(tree, 'p').some(item => item.children.includes('Settings service is unavailable')), true);
+  await tree.props.onSubmit({ preventDefault() {} });
+  assert.equal(writes, 0);
+});
+
+test('an in-flight native save cannot read or publish after plugin disposal', async () => {
+  const env = environment();
+  const pending = deferred();
+  let reads = 0;
+  let publications = 0;
+  const controller = logic.createController({
+    call: async () => { reads++; return { ok: true, value: status() }; },
+    mutateSettings: () => pending.promise,
+  }, env);
+  controller.subscribe(() => { publications++; });
+  await controller.refresh();
+  const saving = controller.save({ position: 'off' }, status()); await settle();
+  controller.dispose();
+  const before = publications;
+  pending.resolve({ revision: 1 });
+  await assert.rejects(saving);
+  assert.equal(publications, before);
+  assert.equal(reads, 1);
+  assert.equal(env.timers.size, 0);
 });
 
 test('refreshPolicy duration is not added to its end-of-request serverNow', async () => {

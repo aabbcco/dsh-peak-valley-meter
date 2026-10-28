@@ -14,9 +14,14 @@ yarn-error.log*
 *.pem
 *.key
 
+# Build output and build-test fixtures
+dist/
+.build-test-*/
+
 # Test output and temporary artifacts
 coverage/
 .rpc-test-*/
+.native-settings-test-*/
 *.log
 *.tgz
 *.tmp

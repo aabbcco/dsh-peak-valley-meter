@@ -1,6 +1,58 @@
 import test from 'node:test'
 import assert from 'node:assert/strict'
 import { BUILTIN_POLICY, CALENDAR, normalizeWindows, evaluateSchedule } from '../lib/policy.js'
+import { Config, CONFIG_FIELDS, DEFAULTS, resolveConfig, validatePatch, readConfig } from '../lib/config.js'
+
+test('native Config declares every editable field volatile with serializable schema and defaults', () => {
+  assert.equal(typeof Config, 'function')
+  assert.equal(typeof Config.toJSON, 'function')
+  assert.equal(typeof Config['~standard'].validate, 'function')
+  assert.equal(Config.type, 'object')
+  for (const [key, schema] of Object.entries(Config.dict)) assert.equal(schema.meta.volatile, true, key)
+  assert.doesNotThrow(() => JSON.stringify(Config.toJSON()))
+  const parsed = Config['~standard'].validate({})
+  assert.equal(parsed.issues, undefined)
+  assert.equal(typeof parsed.value.peakLabel.get, 'function')
+  assert.deepEqual(readConfig(parsed.value), DEFAULTS)
+  assert.equal(DEFAULTS.priceMode, 'official')
+  assert.equal(DEFAULTS.ruleMode, 'official')
+  assert.deepEqual(CONFIG_FIELDS.position.enum, Config.dict.position.list.map(option => option.value))
+  assert.deepEqual(CONFIG_FIELDS.priceMode.enum, ['official', 'custom'])
+  assert.equal(CONFIG_FIELDS.position.default, DEFAULTS.position)
+  assert.equal(CONFIG_FIELDS.peakPrice.type, 'number')
+  assert.equal(CONFIG_FIELDS.peakPrice.min, 0)
+  assert.equal(CONFIG_FIELDS.peakPrice.max, 1_000_000)
+  assert.ok(CONFIG_FIELDS.reminders.schema.refs)
+  assert.doesNotThrow(() => JSON.stringify(CONFIG_FIELDS))
+})
+
+test('partial setting validation never fills missing patch paths or infers legacy modes', () => {
+  assert.deepEqual(validatePatch({ peakLabel: '忙时' }), { peakLabel: '忙时' })
+  assert.deepEqual(validatePatch({ reminders: { onPeak: true } }), { reminders: { onPeak: true } })
+  assert.equal(resolveConfig({ peakPrice: 12 }).priceMode, 'official')
+  assert.equal(resolveConfig({ peakWindows: [] }).ruleMode, 'official')
+  const copy = resolveConfig()
+  copy.reminders.beforePeak = true
+  copy.peakWindows[0][0] = 0
+  assert.equal(resolveConfig().reminders.beforePeak, false)
+  assert.deepEqual(resolveConfig().peakWindows, [[1, 4], [6, 10]])
+})
+
+test('Config and patch validation reject the same invalid field values', () => {
+  for (const patch of [
+    { timezone: 'bad/zone' }, { timezone: '' }, { peakLabel: '   ' }, { peakLabel: 'x'.repeat(41) },
+    { peakPrice: -1 }, { peakPrice: NaN }, { peakPrice: Infinity }, { valleyPrice: '4.5' },
+    { peakColor: 'red' }, { valleyColor: 'url(evil)' }, { usageFloatColor: '#123' },
+    { usageFloatDuration: 0 }, { usageFloatDuration: 9 }, { showClock: 'true' },
+    { unknown: true }, { priceMode: 'legacy' }, { peakWindows: [[1.001, 2]] },
+    { peakWindows: [[1, 1]] }, { peakWindows: [[1, 2, 3]] },
+    { reminders: { beforeMinutes: 0 } }, { reminders: { beforeMinutes: 1.5 } },
+    { reminders: { unknown: false } }, { reminders: null }, { showPrice: null },
+  ]) {
+    assert.ok(Config['~standard'].validate(patch).issues, JSON.stringify(patch))
+    assert.throws(() => validatePatch(patch), undefined, JSON.stringify(patch))
+  }
+})
 
 const HOUR = 3_600_000
 const schedule = (iso, timezone = 'Asia/Shanghai', overrides = {}) =>

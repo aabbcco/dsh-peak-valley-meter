@@ -1,0 +1,122 @@
+name: Release
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Test and package
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    outputs:
+      commit: ${{ steps.commit.outputs.sha }}
+    steps:
+      - name: Check out the release tag
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          persist-credentials: false
+
+      - name: Record the exact source commit
+        id: commit
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@f40ffcd9367d9f12939873eb1018b921a783ffaa # v4
+        with:
+          version: '11.24.0'
+          run_install: false
+
+      - name: Pin npm with Trusted Publishing support
+        run: npm install --global npm@11.6.2 --ignore-scripts
+
+      - name: Validate release version and channel
+        run: node scripts/ci-release.mjs validate
+
+      - name: Install locked dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts --config.auto-install-peers=false
+
+      - name: Test and build the release archive
+        run: npm run build
+
+      - name: Verify archive and checksums
+        id: package
+        run: node scripts/ci-release.mjs verify
+
+      - name: Transfer verified release files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-package
+          path: |
+            dist/${{ steps.package.outputs.archive }}
+            dist/SHA256SUMS.txt
+            dist/build-info.json
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  publish:
+    name: Upload release assets and publish to npm
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: npm
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - name: Check out the verified source commit
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ needs.build.outputs.commit }}
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '24'
+
+      - name: Pin npm with Trusted Publishing support
+        run: npm install --global npm@11.6.2 --ignore-scripts
+
+      - name: Download verified release files
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: release-package
+          path: dist
+
+      - name: Verify the downloaded archive
+        id: package
+        run: node scripts/ci-release.mjs verify
+
+      - name: Check whether this exact package is already published
+        id: npm
+        run: node scripts/ci-release.mjs npm-status
+
+      - name: Upload the package and checksums to the GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          ARCHIVE: ${{ steps.package.outputs.archive }}
+        run: |
+          gh release upload "$RELEASE_TAG" \
+            "dist/$ARCHIVE" dist/SHA256SUMS.txt dist/build-info.json \
+            --clobber
+
+      - name: Publish the same archive through npm OIDC
+        if: steps.npm.outputs.publish_needed == 'true'
+        run: node scripts/ci-release.mjs publish
